@@ -19,8 +19,7 @@ import breeze.linalg._
 
 import org.apache.commons.math3.analysis.{MultivariateFunction, MultivariateVectorFunction}
 import org.apache.commons.math3.optim.{MaxEval, MaxIter, InitialGuess, SimpleValueChecker}
-import org.apache.commons.math3.optim.nonlinear.scalar.{ObjectiveFunction,
-  ObjectiveFunctionGradient}
+import org.apache.commons.math3.optim.nonlinear.scalar.{GoalType, ObjectiveFunction, ObjectiveFunctionGradient}
 import org.apache.commons.math3.optim.nonlinear.scalar.gradient.NonLinearConjugateGradientOptimizer
 import org.apache.commons.math3.random.RandomGenerator
 
@@ -269,18 +268,119 @@ class ARGARCHModel(
   def sample(n: Int, rand: RandomGenerator): Array[Double] = sampleWithVariances(n, rand)._1
 }
 
+object EGARCH {
+  /**
+   * Fits an EGARCH(1, 1) model to the given series of residuals
+   *
+   * @param ts The time series to fit the model to.
+   * @return The model.
+   */
+  def fitModel(ts: Vector[Double]): EGARCHModel = {
+    val optimizer = new NonLinearConjugateGradientOptimizer(
+      NonLinearConjugateGradientOptimizer.Formula.FLETCHER_REEVES,
+      new SimpleValueChecker(1e-6, 1e-6))
+    val gradient = new ObjectiveFunctionGradient(new MultivariateVectorFunction() {
+      def value(params: Array[Double]): Array[Double] = {
+        new EGARCHModel(params(0), params(1), params(2), params(3)).gradient(ts)
+      }
+    })
+    val objectiveFunction = new ObjectiveFunction(new MultivariateFunction() {
+      def value(params: Array[Double]): Double = {
+        new EGARCHModel(params(0), params(1), params(2), params(3)).logLikelihood(ts)
+      }
+    })
+    val mean = sum(ts)/ ts.length
+    val initialGuess = new InitialGuess(Array(0.2, 0.2, 0.2, 0.2)) // TODO: make this smarter
+    val maxIter = new MaxIter(10000)
+    val maxEval = new MaxEval(10000)
+    val goal = GoalType.MAXIMIZE
+    val optimal = optimizer.optimize(objectiveFunction, goal, gradient, initialGuess, maxIter,
+      maxEval)
+    val params = optimal.getPoint
+    new EGARCHModel(params(0), params(1), params(2), params(3))
+  }
+}
+
+//http://www.samsi.info/sites/default/files/Nelson_1991.pdf
 class EGARCHModel(
-    val omega: Double,
     val alpha: Double,
+    val theta: Double,
+    val gamma: Double,
     val beta: Double) extends TimeSeriesModel {
+  /**
+   * Returns the log likelihood of the parameters for the given series
+   * Based on http://swopec.hhs.se/hastef/papers/hastef0564.pdf and
+   * defined as
+   * - 0.5 * sum(ln h_t) - 0.5 * (eps_t ** 2 / h_t) + C (some constant)
+   * we return a value up to a constant, and maximize
+   */
+  def logLikelihood(ts: Vector[Double]): Double = {
+    //accumulators
+    var likelihood = 0.0
+
+    //initialize
+    val n = ts.length
+    var h = variance(ts) //ht is initialized to the overall variance
+    var lnh = math.log(h) // just log of h
+    var z = ts(0) / math.sqrt(h) //first zt term, recall z_t = error_t / sqrt(h_t)
+    var i = 1
+
+    while (i < n) {
+      lnh = alpha + theta * z + gamma * math.abs(z) + beta * lnh
+      h = math.exp(lnh)
+      z = ts(i) / math.sqrt(h)
+      likelihood -= 0.5 * (lnh + math.pow(ts(i), 2) / h)
+      i += 1
+    }
+
+    likelihood
+  }
 
   /**
-   * Returns the log likelihood of the parameters on the given time series.
-   *
-   * Based on http://swopec.hhs.se/hastef/papers/hastef0564.pdf
+   * calculate gradient, source http://swopec.hhs.se/hastef/papers/hastef0564.pdf
    */
-  def logLikelihood(ts: Array[Double]): Double = {
-    throw new UnsupportedOperationException()
+  def gradient(ts: Vector[Double]): Array[Double] = {
+    val dim = 4
+    //accumulators
+    var likelihood = 0.0
+
+    //initialize
+    val n = ts.length
+    var h = variance(ts) //ht is initialized to the overall variance
+    var grad = Array.fill(dim)(0.0) // h_0 not a function of params
+    var lnh = math.log(h) // just log of h
+    var z = ts(0) / math.sqrt(h) //first zt term, recall z_t = error_t / sqrt(h_t)
+
+    var X = Array(1.0, z, math.abs(z), lnh)
+    var dlnHdB = Array.fill(dim)(0.0) // first set of derivatives is 0, since h_0 = var(ts)
+
+    var i = 1
+
+    while (i < n) {
+      dlnHdB = vecOp(
+        X,
+        dlnHdB.map { x => 0.5 * (theta * z + gamma * math.abs(z)) * x + beta * x },
+        _ - _)
+
+      grad = vecOp(
+        grad,
+        dlnHdB.map { x => 0.5 * (math.pow(ts(i), 2) / math.sqrt(h) - 1) * x},
+        _ + _)
+
+      //update values
+      lnh = alpha + theta * z + gamma * math.abs(z) + beta * lnh
+      h = math.exp(lnh)
+      z = ts(i) / math.sqrt(h)
+      X = Array(1.0, z, math.abs(z), lnh)
+      i += 1
+    }
+    grad
+  }
+
+  //vectorize an operation, doesn't check lengths, so be careful!
+  def vecOp(x: Array[Double], y: Array[Double], op: (Double, Double) => Double)
+    : Array[Double] = {
+    x.zip(y).map { case (xi, yi) => op(xi, yi) }
   }
 
   /**
@@ -288,13 +388,45 @@ class EGARCHModel(
    */
   override def removeTimeDependentEffects(ts: Vector[Double], dest: Vector[Double])
     : Vector[Double] = {
-    throw new UnsupportedOperationException()
+    val n = ts.length
+    var h = math.exp(alpha) // assumes z_-1, |z_-1|, and ln h_-1 are all zero
+    var lnh = math.log(h)
+
+    dest(0) = ts(0) / math.sqrt(h)
+
+    var i = 1
+    while (i < n) {
+      lnh = alpha + theta * dest(i - 1) + gamma * math.abs(dest(i - 1)) + beta * lnh
+      h = math.exp(lnh)
+      dest(i) = ts(i) / math.sqrt(h)
+      i += 1
+    }
+    dest
   }
 
   /**
    * {@inheritDoc}
    */
   override def addTimeDependentEffects(ts: Vector[Double], dest: Vector[Double]): Vector[Double] = {
-    throw new UnsupportedOperationException()
+    val n = ts.length
+    var h = math.exp(alpha) // assumes z_-1, |z_-1|, and ln h_-1 are all zero
+    var lnh = math.log(h) // just log of h
+
+    dest(0) = ts(0) * math.sqrt(h)
+
+    var i = 1
+    while (i < n) {
+      lnh = alpha + theta * ts(i - 1) + gamma * math.abs(ts(i - 1)) + beta * lnh
+      h = math.exp(lnh)
+      dest(i) = ts(i) * math.sqrt(h)
+      i += 1
+    }
+    dest
+  }
+
+  def variance(ts: Vector[Double]): Double = {
+    val n = ts.length
+    val mean = sum(ts) / n
+    sum(ts.map{ x => math.pow(x - mean, 2)}) / n
   }
 }
