@@ -18,7 +18,8 @@ package com.cloudera.sparkts
 import breeze.linalg._
 
 import org.apache.commons.math3.analysis.{MultivariateFunction, MultivariateVectorFunction}
-import org.apache.commons.math3.optim.{MaxEval, MaxIter, InitialGuess, SimpleValueChecker}
+import org.apache.commons.math3.optim.nonlinear.scalar.noderiv.BOBYQAOptimizer
+import org.apache.commons.math3.optim.{MaxEval, MaxIter, InitialGuess, SimpleValueChecker, SimpleBounds}
 import org.apache.commons.math3.optim.nonlinear.scalar.{GoalType, ObjectiveFunction, ObjectiveFunctionGradient}
 import org.apache.commons.math3.optim.nonlinear.scalar.gradient.NonLinearConjugateGradientOptimizer
 import org.apache.commons.math3.random.RandomGenerator
@@ -275,7 +276,7 @@ object EGARCH {
    * @param ts The time series to fit the model to.
    * @return The model.
    */
-  def fitModel(ts: Vector[Double]): EGARCHModel = {
+  def fitModelWithCG(ts: Vector[Double]): EGARCHModel = {
     val optimizer = new NonLinearConjugateGradientOptimizer(
       NonLinearConjugateGradientOptimizer.Formula.FLETCHER_REEVES,
       new SimpleValueChecker(1e-6, 1e-6))
@@ -299,6 +300,28 @@ object EGARCH {
     val params = optimal.getPoint
     new EGARCHModel(params(0), params(1), params(2), params(3))
   }
+
+  def fitModelWithBOBYQA(ts: Vector[Double]): EGARCHModel = {
+    val dims = 4
+    val optimizer = new BOBYQAOptimizer(dims * 2 + 1)
+    val objectiveFunction = new ObjectiveFunction(new MultivariateFunction() {
+      def value(params: Array[Double]): Double = {
+        new EGARCHModel(params(0), params(1), params(2), params(3)).logLikelihood(ts)
+      }
+    })
+    val mean = sum(ts)/ ts.length
+    val initialGuess = new InitialGuess(Array(0.2, 0.2, 0.2, 0.2)) // TODO: make this smarter
+    val maxIter = new MaxIter(10000)
+    val maxEval = new MaxEval(10000)
+    val goal = GoalType.MAXIMIZE
+    val bounds = SimpleBounds.unbounded(dims)
+
+    val optimal = optimizer.optimize(objectiveFunction, goal, bounds, initialGuess, maxIter,
+      maxEval)
+    val params = optimal.getPoint
+    new EGARCHModel(params(0), params(1), params(2), params(3))
+  }
+
 }
 
 //http://www.samsi.info/sites/default/files/Nelson_1991.pdf
