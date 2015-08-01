@@ -15,7 +15,7 @@
 
 package com.cloudera.finance.examples
 
-import com.cloudera.sparkts.{UnivariateTimeSeries}
+import com.cloudera.sparkts.UnivariateTimeSeries
 import com.cloudera.sparkts.ARIMA
 import com.cloudera.sparkts.EasyPlot._
 
@@ -33,9 +33,51 @@ object USEconomicsExpositoryExample {
   // as a function of a variety of regressors and then model remaining errors
   // as ARIMA
   def main(args: Array[String]): Unit = {
-    // Read in unemployment rate as
+
     val claims = loadCSV("/Users/josecambronero/Documents/claims.csv")
-    val unemployment = loadCSV("/Users/josecambronero/Documents/unemployment.csv")
+    val sp500Opens = loadCSV("/Users/josecambronero/Documents/sp500Opens.csv").sortWith {
+      (x, y) => x._1.compareTo(y._1) <= 0
+    }.toMap
+
+    val sp500Closes = loadCSV("/Users/josecambronero/Documents/sp500Closes.csv").sortWith {
+      (x, y) => x._1.compareTo(y._1) <= 0
+    }.toMap
+
+    // difference between the open on and the prior day's close
+    val sp500Changes = sp500Opens.map{ case (dt, open) =>
+      val close = sp500Closes.getOrElse(dt.minusDays(1), Double.NaN)
+      (dt, -1 + open/close)
+    }
+
+    // The dates reported for claims are the "week-ending" date for that period
+    // we want release dates. They are released the thursday of the coming week, so
+    // we add 5 days to each date
+    val dayOffset = 5
+    val claimReleases = claims.map { case (dt, v) => (dt.plusDays(dayOffset), v) }
+    val claimChanges = claimReleases.zip(claimReleases.drop(1)).map{ case (prior, current) =>
+      (current._1, -1 + current._2 / prior._2)
+    }
+    // look up the % change between open and close price for SP500 on the day of the release
+    // for dates that aren't found in SP (e.g. release was on holiday, so no market open)
+    // we simply exclude...very small portion of observations
+    val dataOnRelease = claimChanges.map { case (dt, claimsDelta) =>
+      val spDelta = sp500Changes.getOrElse(dt, Double.NaN)
+      (dt, claimsDelta, spDelta)
+    }.filter(!_._3.isNaN).filter(_._1.getYear >= 2014)
+
+    val justClaims = new DenseVector(dataOnRelease.map(_._2))
+    val justSP =  new DenseVector(dataOnRelease.map(_._3))
+
+    ezplot(Seq(justClaims, justSP))
+    ezplot(justClaims)
+    ezplot(justSP)
+
+    // Simple regression log(unemployment)_t = log(claims/1e5)_{t-1} + error
+    val regression = new OLSMultipleLinearRegression()
+    regression.newSampleData(justSP.toArray, justClaims.toArray.map(Array(_)))
+
+    println(s"adjR^2:${regression.calculateAdjustedRSquared()}")
+
 
     // claims is weekly, but unemployment is monthly
     // We will look up the unemployment number associated with the first
@@ -64,14 +106,14 @@ object USEconomicsExpositoryExample {
     val x = data.map(_._1)
 
     // Simple regression log(unemployment)_t = log(claims/1e5)_{t-1} + error
-    val regression = new OLSMultipleLinearRegression()
-    regression.newSampleData(y, x.map(Array(_)))
+    //val regression = new OLSMultipleLinearRegression()
+    //regression.newSampleData(y, x.map(Array(_)))
 
-    println(s"adjR^2:${regression.calculateAdjustedRSquared()}")
+    //println(s"adjR^2:${regression.calculateAdjustedRSquared()}")
 
-    val errors = regression.estimateResiduals()
+    //val errors = regression.estimateResiduals()
     // clearly not white noise. Our parameter estimates are thus inefficent
-    ezplot(errors)
+   // ezplot(errors)
 
     // visualize PACF and ACF
     acfPlot(errors, 10)
