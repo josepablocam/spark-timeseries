@@ -16,15 +16,19 @@
 package com.cloudera.finance.examples
 
 import com.cloudera.sparkts.UnivariateTimeSeries
+import com.cloudera.sparkts.UnivariateTimeSeries.differencesOfOrderD
 import com.cloudera.sparkts.ARIMA
 import com.cloudera.sparkts.EasyPlot._
 
+import org.apache.commons.math3.random.MersenneTwister
 import org.apache.commons.math3.stat.regression.OLSMultipleLinearRegression
-
+import com.cloudera.sparkts.TimeSeriesStatisticalTests._
 import breeze.linalg._
 
 import org.apache.spark.{SparkConf, SparkContext}
 import org.joda.time.LocalDate
+
+import scala.collection.immutable.ListMap
 
 
 object USEconomicsExpositoryExample {
@@ -34,125 +38,97 @@ object USEconomicsExpositoryExample {
   // as ARIMA
   def main(args: Array[String]): Unit = {
 
-    val claims = loadCSV("/Users/josecambronero/Documents/claims.csv")
-    val sp500Opens = loadCSV("/Users/josecambronero/Documents/sp500Opens.csv").sortWith {
-      (x, y) => x._1.compareTo(y._1) <= 0
-    }.toMap
+    val dateSorter = (x: (LocalDate, Double), y: (LocalDate, Double)) => x._1.compareTo(y._1) <= 0
+    val claims = loadCSV("/Users/josecambronero/Documents/claims.csv").sortWith(dateSorter)
+    val sp500 = loadCSV("/Users/josecambronero/Documents/sp500Closes.csv").sortWith(dateSorter)
+    // Claims are reported with Saturday date, move back to Friday (week-ending on ...)
+    val claimsMap = claims.map { case (dt, v) => (dt.minusDays(1), v) }.toMap
+    // match up with SP values by looking up
+    val matchedClaims = sp500.map { case (dt, sp) => claimsMap.getOrElse(dt, Double.NaN) }
+    // interpolate missing values with a spline
+    val interpClaims = UnivariateTimeSeries.fillSpline(matchedClaims)
 
-    val sp500Closes = loadCSV("/Users/josecambronero/Documents/sp500Closes.csv").sortWith {
-      (x, y) => x._1.compareTo(y._1) <= 0
-    }.toMap
+    val data = (
+      sp500.map(_._1),
+      sp500.map(_._2),
+      interpClaims
+      ).zipped.toArray
 
-    // difference between the open on and the prior day's close
-    val sp500Changes = sp500Opens.map{ case (dt, open) =>
-      val close = sp500Closes.getOrElse(dt.minusDays(1), Double.NaN)
-      (dt, -1 + open/close)
-    }
+    // roughly YoY change
+    val yoyChanges = data.zip(data.drop(240)).map { case ((_, pSP, pC), (dt, sp, c)) =>
+      (dt, sp / pSP - 1, c / pC - 1)
+    }.filter(!_._3.isNaN)
 
-    // The dates reported for claims are the "week-ending" date for that period
-    // we want release dates. They are released the thursday of the coming week, so
-    // we add 5 days to each date
-    val dayOffset = 5
-    val claimReleases = claims.map { case (dt, v) => (dt.plusDays(dayOffset), v) }
-    val claimChanges = claimReleases.zip(claimReleases.drop(1)).map{ case (prior, current) =>
-      (current._1, -1 + current._2 / prior._2)
-    }
-    // look up the % change between open and close price for SP500 on the day of the release
-    // for dates that aren't found in SP (e.g. release was on holiday, so no market open)
-    // we simply exclude...very small portion of observations
-    val dataOnRelease = claimChanges.map { case (dt, claimsDelta) =>
-      val spDelta = sp500Changes.getOrElse(dt, Double.NaN)
-      (dt, claimsDelta, spDelta)
-    }.filter(!_._3.isNaN).filter(_._1.getYear >= 2014)
+    // http://www.nber.org/cycles.html states latest part of cycle started june 2009,
+    // we advance a year to avoid capturing bounce from trough, which would result in
+    // a high correlation between the 2 variable simply for macroeconomic reasons, not
+    // any inherent relationship
+    val latestCycle = yoyChanges.filter(_._1.compareTo(new LocalDate(2010, 6, 1)) >= 0)
 
-    val justClaims = new DenseVector(dataOnRelease.map(_._2))
-    val justSP =  new DenseVector(dataOnRelease.map(_._3))
+    val justSP = new DenseVector(latestCycle.map(_._2))
+    val justClaims = new DenseVector(latestCycle.map(_._3))
 
-    ezplot(Seq(justClaims, justSP))
-    ezplot(justClaims)
-    ezplot(justSP)
+    val fig = plotnv(Seq(justClaims, justSP), '-')
 
-    // Simple regression log(unemployment)_t = log(claims/1e5)_{t-1} + error
-    val regression = new OLSMultipleLinearRegression()
-    regression.newSampleData(justSP.toArray, justClaims.toArray.map(Array(_)))
+    val simpleRegression = new OLSMultipleLinearRegression()
+    simpleRegression.newSampleData(justSP.toArray, justClaims.toArray.map(Array(_)))
 
-    println(s"adjR^2:${regression.calculateAdjustedRSquared()}")
+    println(s"adjR^2:${simpleRegression.calculateAdjustedRSquared()}")
 
 
-    // claims is weekly, but unemployment is monthly
-    // We will look up the unemployment number associated with the first
-    // day of that month, and then fill in with NAs repeated dates, and interpolate
-    val startOfMonth = claims.map { case (dt, claim) =>
-      new LocalDate(dt.getYear, dt.getMonthOfYear, 1)
-    }
-    val unEmploymentMap = unemployment.clone().toMap
-    val unemployExtended = startOfMonth.tail.scanLeft((startOfMonth.head, false)) {
-      case ((priorDt, b), dt) => (dt, priorDt == dt)
-    }.map{ case (dt, repeat) =>
-      if (repeat) Double.NaN else unEmploymentMap.getOrElse(dt, Double.NaN)
-    }
+    val residuals = simpleRegression.estimateResiduals()
 
-    // interpolate with cubic spline
-    val interpUnemploy = UnivariateTimeSeries.fillSpline(unemployExtended)
-
-    //apply logs to both
-    val claimsLog = claims.map(_._2 / 1e5) //claims.map(x => math.log(x._2 / 1e5))
-    val unEmployLog = interpUnemploy //interpUnemploy.map(math.log)
-
-    // Lag claims 1 period and remove any missing information
-    //val data = claimsLog.zip(unEmployLog.drop(1)).filter { case (x, y) => !x.isNaN && ! y.isNaN }
-    val data = claimsLog.zip(unEmployLog).filter { case (x, y) => !x.isNaN && ! y.isNaN }
-    val y = data.map(_._2)
-    val x = data.map(_._1)
-
-    // Simple regression log(unemployment)_t = log(claims/1e5)_{t-1} + error
-    //val regression = new OLSMultipleLinearRegression()
-    //regression.newSampleData(y, x.map(Array(_)))
-
-    //println(s"adjR^2:${regression.calculateAdjustedRSquared()}")
-
-    //val errors = regression.estimateResiduals()
-    // clearly not white noise. Our parameter estimates are thus inefficent
-   // ezplot(errors)
-
-    // visualize PACF and ACF
-    acfPlot(errors, 10)
-    pacfPlot(errors, 10)
-
-    // ACF plot shows that series is likely to be unit root, non-stationary, we should try
-    // differencing
-    val diffedY = differenced(y, 2)
-    val diffedX = differenced(x, 2)
-
-
-    val diffedRegression = new OLSMultipleLinearRegression()
-    diffedRegression.newSampleData(diffedY, diffedX.map(Array(_)))
-    val diffedErrors = diffedRegression.estimateResiduals()
-    acfPlot(diffedErrors, 10) // much better, but clearly there is serial correlation
-    pacfPlot(diffedErrors, 10)
-
-    val errorModel = ARIMA.fitModel((2, 1, 2), new DenseVector(diffedErrors), method = "css-CGD")
-    val n = diffedY.length
-    val adjustedY = errorModel.removeTimeDependentEffects(
-      new DenseVector(diffedY),
-      new DenseVector(Array.fill(n)(0.0))
+    val changingVarianceResults = bptest(
+      new DenseVector(residuals),
+      new DenseMatrix(justClaims.length, 1,  justClaims.toArray)
     )
+    println("Breusch-Pagan results: " + changingVarianceResults)
 
-    val adjustedX = errorModel.removeTimeDependentEffects(
-      new DenseVector(diffedX),
-      new DenseVector(Array.fill(n)(0.0))
-    )
+    val serialCorrResults = bgtest(
+      new DenseVector(residuals),
+      new DenseMatrix(justClaims.length, 1, justClaims.toArray),
+      maxLag = 10)
+    println("Breusch-Godfrey results: " + serialCorrResults)
 
-    // run new regression: this procedure is known as Cochrane-Orcutt... it's the
-    // "poor" man's ARIMAX
-    val transRegression = new OLSMultipleLinearRegression()
-    transRegression.newSampleData(adjustedY.toArray, adjustedX.toArray.map(Array(_)))
-    val newErrors = transRegression.estimateResiduals()
+    // Compare to results for white noise
+    println("Demostrating results if residuals were white noise")
+    val rand = new MersenneTwister(10L)
+    val whiteNoise = Array.fill(residuals.length)(rand.nextGaussian)
 
-    ezplot(newErrors)
+    val refSerialCorrResults = bgtest(
+      new DenseVector(whiteNoise),
+      new DenseMatrix(justClaims.length, 1, justClaims.toArray),
+      maxLag = 10)
+    println("Breusch-Godfrey results for WN: " + refSerialCorrResults)
+
+    val residualPlot = plot1(residuals, '-')
+    residualPlot.saveas("/Users/josecambronero/Documents/residuals.png")
+
+    acfPlot()
+
+    acfPlot(differencesOfOrderD(new DenseVector(residuals),1).toArray, 10)
+    pacfPlot(differencesOfOrderD(new DenseVector(residuals),1).toArray, 10)
+    val model =
+
+
+    // let's model our residuals as ARIMA (we'll see if the heteroskedasticity is an issue)
+    val errorVector = new DenseVector(residuals)
+    val errorModel = ARIMA.fitModel(1, 1, 1, errorVector)
+    val forecasted = errorModel.forecast(errorVector, 100)
+    plotnv(Seq(errorVector, forecasted), '-')
+
+
+    // Transform our original regression
+    val transSP = errorModel.removeTimeDependentEffects(justSP, justSP.copy)
+    val transClaims = errorModel.removeTimeDependentEffects(justClaims, justClaims.copy)
+
+    val newModel = new OLSMultipleLinearRegression()
+    newModel.newSampleData(transSP.toArray.drop(2), transClaims.toArray.drop(2).map(Array(_)))
+    println(s"adjR^2:${newModel.calculateAdjustedRSquared()}")
+
+
 
   }
-
   def loadCSV(file: String): Array[(LocalDate, Double)] = {
     val text = scala.io.Source.fromFile(file).getLines().toArray
     // we skip labels
