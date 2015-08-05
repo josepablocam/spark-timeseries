@@ -54,7 +54,7 @@ object USEconomicsExpositoryExample {
     // roughly YoY change
     val yoyChanges = data.zip(data.drop(240)).map { case ((_, pSP, pC), (dt, sp, c)) =>
       (dt, sp / pSP - 1, c / pC - 1)
-    }.filter(!_._3.isNaN)
+    }.filter(x => !(x._3.isNaN || x._2.isNaN))
 
     // http://www.nber.org/cycles.html states latest part of cycle started june 2009,
     // we advance a year to avoid capturing bounce from trough, which would result in
@@ -75,7 +75,10 @@ object USEconomicsExpositoryExample {
     val simpleRegression = new OLSMultipleLinearRegression()
     simpleRegression.newSampleData(justSP.toArray, justClaims.toArray.map(Array(_)))
 
-    println(s"adjR^2:${simpleRegression.calculateAdjustedRSquared()}")
+    println(s"Original OLS adj. R^2:${simpleRegression.calculateAdjustedRSquared()}")
+    println("Original OLS Params: "  +
+      simpleRegression.estimateRegressionParameters().mkString(",")
+    )
 
     val residuals = new DenseVector(simpleRegression.estimateResiduals())
 
@@ -114,11 +117,16 @@ object USEconomicsExpositoryExample {
     diffedResidualPACFPlot.saveas(SAVEPATH + "diffed_residuals_PACF.png")
 
 
-    // let's model our residuals as ARIMA (we'll see if the heteroskedasticity is an issue)
-    val errorModel = ARIMA.fitModel(1, 1, 1, residuals)
+    // let's model our residuals as ARIMA
+    val errorModel = ARIMA.fitModel(
+      1, 1, 1, //p, d, q
+      residuals,
+      includeIntercept = false, // we don't want drift in our model
+      method = "css-cgd",
+      userInitParams = null
+    )
     val forecasted = errorModel.forecast(residuals, 240)
     println("Model coefficients:" + errorModel.coefficients.mkString(","))
-
 
     val extendedResiduals = DenseVector.vertcat(residuals,
       new DenseVector(Array.fill(240)(Double.NaN))
