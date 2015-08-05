@@ -39,12 +39,18 @@ object EasyPlot {
 
     def ezplot(arr: Array[Double]): Figure = ezplot(arr, '-')
 
-  def ezplot(vecs: Seq[Vector[Double]], style: Char): Figure = {
+  def ezplot(vecs: Seq[Vector[Double]], style: Char, names: Array[String] = null): Figure = {
     val f = Figure()
     val p = f.subplot(0)
     val first = vecs.head
-    vecs.foreach { vec =>
-      p += plot((0 until first.length).map(_.toDouble).toArray, vec, style)
+    vecs.indices.foreach { i =>
+      val vec = vecs(i)
+      val series = if (names == null){
+        plot((0 until first.length).map(_.toDouble).toArray, vec, style)
+      } else  {
+        plot((0 until first.length).map(_.toDouble).toArray, vec, style, name = names(i))
+      }
+      p += series
     }
     f
   }

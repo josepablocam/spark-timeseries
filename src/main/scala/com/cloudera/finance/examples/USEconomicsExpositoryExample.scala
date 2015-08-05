@@ -25,22 +25,19 @@ import org.apache.commons.math3.stat.regression.OLSMultipleLinearRegression
 import com.cloudera.sparkts.TimeSeriesStatisticalTests._
 import breeze.linalg._
 
-import org.apache.spark.{SparkConf, SparkContext}
 import org.joda.time.LocalDate
-
-import scala.collection.immutable.ListMap
-
 
 object USEconomicsExpositoryExample {
   // Illustrates the idea behind using ARIMA, we build upon this conceptually in
-  // the USEconomicsExample, where we predict various economic indicators
-  // as a function of a variety of regressors and then model remaining errors
-  // as ARIMA
+  // by creating a simplistic regression and modeling error terms as ARIMA
   def main(args: Array[String]): Unit = {
+    // Dummy hardcoded paths for now...
+    val DATAPATH = "/Users/josecambronero/Documents/"
+    val SAVEPATH = "/Users/josecambronero/Projects/summer_presentation/"
 
     val dateSorter = (x: (LocalDate, Double), y: (LocalDate, Double)) => x._1.compareTo(y._1) <= 0
-    val claims = loadCSV("/Users/josecambronero/Documents/claims.csv").sortWith(dateSorter)
-    val sp500 = loadCSV("/Users/josecambronero/Documents/sp500Closes.csv").sortWith(dateSorter)
+    val claims = loadCSV(DATAPATH + "claims.csv").sortWith(dateSorter)
+    val sp500 = loadCSV(DATAPATH + "sp500Closes.csv").sortWith(dateSorter)
     // Claims are reported with Saturday date, move back to Friday (week-ending on ...)
     val claimsMap = claims.map { case (dt, v) => (dt.minusDays(1), v) }.toMap
     // match up with SP values by looking up
@@ -68,24 +65,28 @@ object USEconomicsExpositoryExample {
     val justSP = new DenseVector(latestCycle.map(_._2))
     val justClaims = new DenseVector(latestCycle.map(_._3))
 
-    val fig = plotnv(Seq(justClaims, justSP), '-')
+    val bothTSPlot = ezplot(
+      Seq(justClaims, justSP),
+      '-', Array("Claims YoY Chg.", "SP500 YoY Chg.")
+    )
+    bothTSPlot.subplot(0).legend_=(true)
+    bothTSPlot.saveas(SAVEPATH + "claims_and_sp500.png")
 
     val simpleRegression = new OLSMultipleLinearRegression()
     simpleRegression.newSampleData(justSP.toArray, justClaims.toArray.map(Array(_)))
 
     println(s"adjR^2:${simpleRegression.calculateAdjustedRSquared()}")
 
-
-    val residuals = simpleRegression.estimateResiduals()
+    val residuals = new DenseVector(simpleRegression.estimateResiduals())
 
     val changingVarianceResults = bptest(
-      new DenseVector(residuals),
+      residuals,
       new DenseMatrix(justClaims.length, 1,  justClaims.toArray)
     )
     println("Breusch-Pagan results: " + changingVarianceResults)
 
     val serialCorrResults = bgtest(
-      new DenseVector(residuals),
+      residuals,
       new DenseMatrix(justClaims.length, 1, justClaims.toArray),
       maxLag = 10)
     println("Breusch-Godfrey results: " + serialCorrResults)
@@ -101,34 +102,46 @@ object USEconomicsExpositoryExample {
       maxLag = 10)
     println("Breusch-Godfrey results for WN: " + refSerialCorrResults)
 
-    val residualPlot = plot1(residuals, '-')
-    residualPlot.saveas("/Users/josecambronero/Documents/residuals.png")
+    val residualPlot = ezplot(residuals, '-')
+    residualPlot.saveas(SAVEPATH + "simple_residuals.png")
 
-    acfPlot()
+    val residualACFPlot = acfPlot(residuals.toArray, 10)
+    residualACFPlot.saveas(SAVEPATH + "simple_residuals_ACF.png")
 
-    acfPlot(differencesOfOrderD(new DenseVector(residuals),1).toArray, 10)
-    pacfPlot(differencesOfOrderD(new DenseVector(residuals),1).toArray, 10)
-    val model =
+    val diffedResidualACFPlot = acfPlot(differencesOfOrderD(residuals,1).toArray, 10)
+    val diffedResidualPACFPlot = pacfPlot(differencesOfOrderD(residuals,1).toArray, 10)
+    diffedResidualACFPlot.saveas(SAVEPATH + "diffed_residuals_ACF.png")
+    diffedResidualPACFPlot.saveas(SAVEPATH + "diffed_residuals_PACF.png")
 
 
     // let's model our residuals as ARIMA (we'll see if the heteroskedasticity is an issue)
-    val errorVector = new DenseVector(residuals)
-    val errorModel = ARIMA.fitModel(1, 1, 1, errorVector)
-    val forecasted = errorModel.forecast(errorVector, 100)
-    plotnv(Seq(errorVector, forecasted), '-')
+    val errorModel = ARIMA.fitModel(1, 1, 1, residuals)
+    val forecasted = errorModel.forecast(residuals, 240)
+    println("Model coefficients:" + errorModel.coefficients.mkString(","))
 
 
-    // Transform our original regression
+    val extendedResiduals = DenseVector.vertcat(residuals,
+      new DenseVector(Array.fill(240)(Double.NaN))
+    )
+    val forecastedPlot = ezplot(Seq(extendedResiduals , forecasted), '-')
+    forecastedPlot.saveas(SAVEPATH + "forecasted_ARIMA.png")
+
+    // Transform our original regression using 1 iteration of Cochrane-Orcutt
     val transSP = errorModel.removeTimeDependentEffects(justSP, justSP.copy)
     val transClaims = errorModel.removeTimeDependentEffects(justClaims, justClaims.copy)
 
-    val newModel = new OLSMultipleLinearRegression()
-    newModel.newSampleData(transSP.toArray.drop(2), transClaims.toArray.drop(2).map(Array(_)))
-    println(s"adjR^2:${newModel.calculateAdjustedRSquared()}")
+    val transModel = new OLSMultipleLinearRegression()
+    transModel.newSampleData(transSP.toArray.drop(2), transClaims.toArray.drop(2).map(Array(_)))
 
+    println(s"Transformed Model Parameters:${
+      transModel.estimateRegressionParameters().mkString(",")
+    }")
 
-
+    val transResiduals = transModel.estimateResiduals()
+    val transResidualPlot = ezplot(transResiduals, '-')
+    transResidualPlot.saveas(SAVEPATH + "trans_residuals.png")
   }
+
   def loadCSV(file: String): Array[(LocalDate, Double)] = {
     val text = scala.io.Source.fromFile(file).getLines().toArray
     // we skip labels
@@ -137,21 +150,6 @@ object USEconomicsExpositoryExample {
       val date = new LocalDate(tokens.head)
       val measures = tokens(1).toDouble
       (date, measures)
-    }
-  }
-
-  def differenced(x: Array[Double], offset: Int): Array[Double] = {
-    val n = x.length
-    val newArray = Array.fill(n - offset)(0.0)
-    if (offset == 0) {
-      x.clone()
-    } else {
-      var i = 0
-      while (i < n - offset) {
-        newArray(i) = x(i + offset) - x(i)
-        i += 1
-      }
-      newArray
     }
   }
 }
