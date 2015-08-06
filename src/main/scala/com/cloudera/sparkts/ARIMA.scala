@@ -28,6 +28,7 @@ import org.apache.commons.math3.optim.nonlinear.scalar.{GoalType, ObjectiveFunct
 import org.apache.commons.math3.optim.nonlinear.scalar.noderiv.BOBYQAOptimizer
 import org.apache.commons.math3.random.RandomGenerator
 import org.apache.commons.math3.stat.regression.OLSMultipleLinearRegression
+import org.apache.commons.math3.analysis.solvers.LaguerreSolver
 
 /**
  * ARIMA models allow modeling timeseries as a function of prior values of the series
@@ -581,5 +582,27 @@ class ARIMAModel(
       results(-(d + nFuture) to -1) := forwardIntegrated
     }
     results
+  }
+
+  def isStationary(): Boolean = {
+    // https://en.wikipedia.org/wiki/Laguerre%27s_method
+    val offset = if (hasIntercept) 1 else 0
+    // 1 - phi_1*x - phi_2*x^2 - ... - phi_p*x^p = 0
+    val poly = Array(1.0) ++ coefficients.slice(offset, offset + p).map(-_)
+    allRootsWithInUnitCircle(poly)
+  }
+
+  def isInvertible(): Boolean = {
+    val offset = if (hasIntercept) 1 else 0
+    // 1 + theta_1 * x + theta_2 * x + ... + theta_q * x ^ q = 0
+    val poly = Array(1.0) ++ coefficients.drop(offset + p)
+    allRootsWithInUnitCircle(poly)
+  }
+
+  private def allRootsWithInUnitCircle(poly: Array[Double]): Boolean = {
+    val solver = new LaguerreSolver()
+    val initGuess = 0.0 // TODO: make smarter
+    val roots = solver.solveAllComplex(poly, initGuess)
+    !roots.exists(_.abs() >= 1.0)
   }
 }
