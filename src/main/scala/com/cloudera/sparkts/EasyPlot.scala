@@ -51,6 +51,13 @@ object EasyPlot {
 
   def ezplot(vecs: Seq[Vector[Double]]): Figure = ezplot(vecs, '-')
 
+  def ezplot(x: Array[Double], y: Array[Double], style: Char): Figure = {
+    val f = Figure()
+    val p = f.subplot(0)
+    p += plot(x = x, y = y, style = style)
+    f
+  }
+
   /**
    * Autocorrelation function plot
    * @param data array of data to analyze
