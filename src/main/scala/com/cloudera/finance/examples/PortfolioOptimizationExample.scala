@@ -36,6 +36,7 @@ import org.apache.spark.mllib.linalg.{Matrix => SparkMatrix, Vector => SparkVect
 import org.apache.commons.math3.stat.regression.OLSMultipleLinearRegression
 
 import scala.util.{Failure, Success, Try}
+import scala.collection.Iterable
 
 
 object PortfolioOptimizationExample {
@@ -62,43 +63,70 @@ object PortfolioOptimizationExample {
     // Only look at close prices during 2015
     val startDate = nextBusinessDay(new DateTime("2015-1-1"))
     val endDate = nextBusinessDay(new DateTime("2015-6-6"))
-    val recentData = tsRdd.slice(startDate, endDate)
+    val recentRdd = tsRdd.slice(startDate, endDate)
+
+    // take only part of the universe
+    val nAssets = 200
+    val reducedRdd = recentRdd.takeNSeries(nAssets)
 
     // Impute missing data with spline interpolation
     // fill forward and then backward for any remaining missing values
     // anything that still has NaNs we'll just drop...
-    val filledRdd = recentData.
+    val filledRdd = reducedRdd.
       fill("linear").
       fill("previous").
       fill("next").
       filter(x => !x._2.toArray.exists(_.isNaN))
 
+
     // Calculate returns and fill first value with nearest....
     // Note that in the real world we would adjust prices for splits etc before
     // calculating returns
     val returnRdd = filledRdd.price2ret()
-    val local = returnRdd.collect()
-
-    // TODO: how many of these prices are missing>
 
     // Convert returns into a matrix to distribute covariance calculation and average
-    // returns calculation
+    // returns calculation. We use toRowMatrix as we have no plans on directly
+    // indexing into our structure
 
-    val retMatrixRdd = returnRdd.toIndexedRowMatrix()
-    val avgReturnsPerAsset = sparkVectortoBreeze(
-      retMatrixRdd.toRowMatrix().computeColumnSummaryStatistics().mean
-    )
-    val covMatrix = sparkMatrixtoBreeze(retMatrixRdd.toRowMatrix().computeCovariance())
+    val retMatrixRdd = returnRdd.toRowMatrix()
+    val avgReturnsPerAsset = sparkVectortoBreeze(retMatrixRdd.computeColumnSummaryStatistics().mean)
+
+
+    // let's plot out the average returns
+    EasyPlot.ezplot(avgReturnsPerAsset)
+    /// Woah! one of these guys spiked...Not reasonable
+    val List(cIx) = which(avgReturnsPerAsset.toArray, (x: Double) => x == max(avgReturnsPerAsset))
+
+    val culpritTicker = returnRdd.keys.collect()(cIx)
+    // Let's check out prices without any of our imputation
+    val culpritPrices = recentRdd.lookup(culpritTicker).head
+    // Clearly there was some kind of jump in these prices, let's check the date of the largest
+    // increase
+    EasyPlot.ezplot(culpritPrices)
+    val culpritPxDeltas = diff(culpritPrices.toDenseVector).toArray
+    val List(dateIxMinus1) = which(culpritPxDeltas, (x: Double) => x == culpritPxDeltas.max)
+    val culpritDate = recentRdd.index.dateTimeAtLoc(dateIxMinus1 + 1)
+    // If we look up this date, we can see that
+    // http://ir.amsc.com/releasedetail.cfm?ReleaseID=903185
+    // AMSC had a reverse stock split that date: where the total # of stock goes down
+    // and the prices increase s.t. the market capitalization of the company remains the same
+    // in the real world we would adjust for this kind of things....in blog world
+    // we're just gonna go ahead and drop this stock
+
+    val cleanReturnRdd = filledRdd.filter(_._1 != culpritTicker).price2ret()
+    val cleanRetMatrixRdd = cleanReturnRdd.toRowMatrix()
+    val cleanAvgAssetRet = sparkVectortoBreeze(cleanRetMatrixRdd.computeColumnSummaryStatistics().mean)
+    val covMatrix = sparkMatrixtoBreeze(cleanRetMatrixRdd.computeCovariance())
 
     // distributed
-    val frontierPoints = markowitzFrontier(sc, covMatrix, avgReturnsPerAsset, 1000)
+    val frontierPoints = markowitzFrontier(sc, covMatrix, cleanAvgAssetRet, 1000)
     // graph it
     EasyPlot.ezplot(frontierPoints.map(_._2), frontierPoints.map(_._1), '.')
 
     // find the portfolio with the minimum variance and show ER and allocations
     val (er, mr, w) = markowitzOptimal(
       covMatrix,
-      avgReturnsPerAsset,
+      cleanAvgAssetRet,
       frontierPoints.map(x=> (x._1, x._2))
     )
 
@@ -233,6 +261,10 @@ object PortfolioOptimizationExample {
 
   def sparkVectortoBreeze(v: SparkVector): DenseVector[Double] = {
     new DenseVector(v.toArray)
+  }
+
+  def which[A, T](c: A, f: T => Boolean)(implicit ev: A => Iterable[T]): List[Int] = {
+    c.zipWithIndex.filter(x => f(x._1)).map(_._2).toList
   }
 }
 
