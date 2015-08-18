@@ -23,7 +23,7 @@ import com.cloudera.sparkts.TimeSeriesRDD._
 
 import com.github.nscala_time.time.Imports._
 
-import org.apache.spark.{SparkConf, SparkContext}
+import org.apache.spark.SparkContext
 import org.apache.spark.rdd.RDD
 import org.apache.spark.mllib.linalg.{Matrix => SparkMatrix, Vector => SparkVector, Vectors}
 import org.apache.spark.mllib.linalg.distributed.RowMatrix
@@ -67,12 +67,6 @@ object PortfolioOptimizationExample {
       10000)
 
     EasyPlot.ezplot(randFrontierPoints.map(_._2), randFrontierPoints.map(_._1), '.')
-    val validRandPoints = randFrontierPoints.filter { p =>
-      val w = p._3.toArray
-      !w.exists(wi => wi < 0)
-    }
-    validRandPoints.length / randFrontierPoints.length.toDouble
-    EasyPlot.ezplot(validRandPoints.map(_._2), validRandPoints.map(_._1), '.')
 
     // Real data example: daily price data from Yahoo finance
     // Load and parse the data, you might
