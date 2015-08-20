@@ -140,7 +140,7 @@ class TimeSeriesRDD(val index: DateTimeIndex, parent: RDD[(String, Vector[Double
   def dropNSeries(n: Int): TimeSeriesRDD = {
     require(n >= 0, "n cannot be negative")
     val excludeSeries = this.keys.take(n)
-    this.filter(x => !excludeSeries.contains(x._1))
+    filter(x => !excludeSeries.contains(x._1))
   }
 
   /**

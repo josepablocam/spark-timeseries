@@ -16,9 +16,10 @@
 package com.cloudera.finance.examples
 
 import breeze.linalg._
+import breeze.plot.{Figure, plot}
 import com.cloudera.finance.YahooParser
 import com.cloudera.sparkts.DateTimeIndex._
-import com.cloudera.sparkts.{TimeSeriesKryoRegistrator, EasyPlot, TimeSeries}
+import com.cloudera.sparkts.{EasyPlot, TimeSeries}
 import com.cloudera.sparkts.TimeSeriesRDD._
 
 import com.github.nscala_time.time.Imports._
@@ -35,16 +36,18 @@ import scala.collection.Iterable
 
 object PortfolioOptimizationExample {
   def main(args: Array[String]): Unit = {
-    val inputDir = "/Users/josecambronero/Projects/spark-timeseries/src/main/resources/data"
+    val path = "/Users/josecambronero/Projects/spark-timeseries/src/main/resources/"
+    val inputDir = path + "data"
     val sc = new SparkContext("local", "portfolioOptim")
 
     // Let's warm up with some simulated data
     val rand = new MersenneTwister(10L)
-    val nRandAssets = 20
+    val nRandAssets = 10
 
     // simulated returns
     val sampledRets = sc.parallelize(
-      Array.fill(1000)(Vectors.dense(Array.fill(nRandAssets)(rand.nextGaussian))))
+      Array.fill(1000)(Vectors.dense(Array.fill(nRandAssets)(rand.nextGaussian)))
+    )
     val sampledRetMatrix = new RowMatrix(sampledRets)
     val avgSampledRets = sparkVectortoBreeze(sampledRetMatrix.computeColumnSummaryStatistics().mean)
     val sampledRetsCov = sparkMatrixtoBreeze(sampledRetMatrix.computeCovariance())
@@ -57,16 +60,27 @@ object PortfolioOptimizationExample {
     val randReturns = randPortfolios.map(x => ret(avgSampledRets, x.toDenseVector))
     val randSDs = randPortfolios.map(risk(sampledRetsCov, _))
 
-    EasyPlot.ezplot(x = randSDs.map(math.pow(_, 2)), y = randReturns, '.')
+    val randPortfolioPlot = EasyPlot.ezplot(x = randSDs.map(math.pow(_, 2)), y = randReturns, '.')
+    addLabels(randPortfolioPlot, Some("Portfolio Variance"), Some("Portfolio Expected Return"))
+    randPortfolioPlot.saveas(path + "rand_portfolios.png")
 
     val randFrontierPoints = markowitzFrontier(sc,
       sampledRetsCov,
       avgSampledRets,
-      0.0,
-      max(avgSampledRets),
-      10000)
+      min(randReturns),
+      max(randReturns),
+      100000)
 
-    EasyPlot.ezplot(randFrontierPoints.map(_._2), randFrontierPoints.map(_._1), '.')
+    // add the frontier to the plot of random portfolios
+    // unfortunately cannot clone a plot, so we'll have to mutate :(
+    randPortfolioPlot.subplot(0) += plot(
+      x = randFrontierPoints.map(_._2).map(math.pow(_, 2)),
+      y = randFrontierPoints.map(_._1),
+      colorcode = "red",
+      style = '.',
+      name = "efficient frontier"
+    )
+    randPortfolioPlot.saveas(path + "rand_portfolios_with_frontier.png")
 
     // Real data example: daily price data from Yahoo finance
     // Load and parse the data, you might
@@ -91,12 +105,10 @@ object PortfolioOptimizationExample {
 
     // Impute missing data with spline interpolation
     // fill forward and then backward for any remaining missing values
-    // anything that still has NaNs we'll just drop...
     val filledRdd = reducedRdd.
-      fill("linear").
+      fill("spline").
       fill("previous").
-      fill("next").
-      filter(x => !x._2.toArray.exists(_.isNaN))
+      fill("next")
 
     // Calculate returns as change in closing price day-over-day
     // Note that in the real world we would adjust prices for splits etc before
@@ -109,10 +121,12 @@ object PortfolioOptimizationExample {
     val retMatrix = returnRdd.toRowMatrix()
     val avgReturnsPerAsset = sparkVectortoBreeze(retMatrix.computeColumnSummaryStatistics().mean)
 
-    // let's plot out the average returns
-    EasyPlot.ezplot(avgReturnsPerAsset)
+    // let's plot out the average returns for out investment universe
+    val avgReturnsPerAssetPlot = EasyPlot.ezplot(avgReturnsPerAsset)
+    addLabels(avgReturnsPerAssetPlot, ylabel = Some("Average Returns Per Asset"))
+    avgReturnsPerAssetPlot.saveas(path + "avg_returns_per_asset.png")
 
-    /// Woah! one of these tickers spiked...Not reasonable
+    /// Woah! one of these tickers is clearly an outlier...Not reasonable
     val List(pos) = which(avgReturnsPerAsset.toArray, (x: Double) => x == max(avgReturnsPerAsset))
 
     val culpritTicker = returnRdd.keys.collect()(pos)
@@ -127,13 +141,8 @@ object PortfolioOptimizationExample {
     val List(dateIxMinus1) = which(culpritPxDeltas, (x: Double) => x == maxPxJump)
     // add 1, since Breeze's diff drops 1 item
     val culpritDate = recentRdd.index.dateTimeAtLoc(dateIxMinus1 + 1)
-    // If we look up this date, we can see that according to
-    // http://ir.amsc.com/releasedetail.cfm?ReleaseID=903185
-    // AMSC had a reverse stock split that date: where the total # of stock goes down
-    // and the prices increase s.t. the market capitalization of the company remains the same
-    // in the real world we would adjust for this kind of things....in blog world
-    // we're just gonna go ahead and drop this stock
-
+    // according to http://ir.amsc.com/releasedetail.cfm?ReleaseID=903185
+    // AMSC had a reverse stock split, filter out
     val cleanRdd = filledRdd.filter(_._1 != culpritTicker).price2ret()
     val cleanMatrix = cleanRdd.toRowMatrix()
     val cleanAvgAssetRet = sparkVectortoBreeze(cleanMatrix.computeColumnSummaryStatistics().mean)
@@ -151,7 +160,14 @@ object PortfolioOptimizationExample {
     val frontierSDs = frontierPoints.map(_._2)
 
     // graph it
-    EasyPlot.ezplot(x = frontierSDs.map(x => math.pow(x, 2)), y = frontierReturns, '.')
+    val finalFrontierPlot = EasyPlot.ezplot(
+      x = frontierSDs.map(x => math.pow(x, 2)),
+      y = frontierReturns,
+      '.'
+    )
+
+    addLabels(finalFrontierPlot, Some("Portfolio Variance"), Some("Portfolio Expected Return"))
+    finalFrontierPlot.saveas(path + "final_frontier.png")
   }
 
 
@@ -278,6 +294,13 @@ object PortfolioOptimizationExample {
     val invertedLHS = safeInversion(lhs)
     val expectedReturns = sc.parallelize((s to e by delta).toArray[Double])
     expectedReturns.map { r => markowitzSolveFrontierPoint(covMatrix, invertedLHS, r) }.collect()
+  }
+
+  // simple convenience function to add labels to an existing figure
+  def addLabels(f: Figure, xlabel: Option[String] = None, ylabel: Option[String] = None): Unit = {
+    // assume the plot is at position 0
+    xlabel.foreach(f.subplot(0).xlabel_=)
+    ylabel.foreach(f.subplot(0).ylabel_=)
   }
 }
 
