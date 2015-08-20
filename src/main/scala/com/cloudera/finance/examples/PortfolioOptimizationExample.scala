@@ -21,6 +21,7 @@ import com.cloudera.finance.YahooParser
 import com.cloudera.sparkts.DateTimeIndex._
 import com.cloudera.sparkts.{EasyPlot, TimeSeries}
 import com.cloudera.sparkts.TimeSeriesRDD._
+import com.cloudera.sparkts.TimeSeriesRDD
 
 import com.github.nscala_time.time.Imports._
 
@@ -101,7 +102,7 @@ object PortfolioOptimizationExample {
 
     // take only part of the universe for our portfolio (first X number of series)
     val nAssets = 200
-    val reducedRdd = recentRdd.takeNSeries(nAssets)
+    val reducedRdd = lazyTake(recentRdd, nAssets)
 
     // Impute missing data with spline interpolation
     // fill forward and then backward for any remaining missing values
@@ -199,6 +200,14 @@ object PortfolioOptimizationExample {
   // Returns the indices for the elements in a given collection that satisfy the predicate
   def which[A, T](c: A, f: T => Boolean)(implicit ev: A => Iterable[T]): List[Int] = {
     c.zipWithIndex.filter(x => f(x._1)).map(_._2).toList
+  }
+
+  // RDD related utility
+  // returns the first N series as a new reduced TimeSeriesRDD
+  def lazyTake(data: TimeSeriesRDD, n: Int): TimeSeriesRDD = {
+    require(n >= 0, "n cannot be negative")
+    val includeSeries = data.keys.take(n)
+    data.filter(x => includeSeries.contains(x._1))
   }
 
   // Markowitz-related functions
