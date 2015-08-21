@@ -19,9 +19,8 @@ import breeze.linalg._
 import breeze.plot.{Figure, plot}
 import com.cloudera.finance.YahooParser
 import com.cloudera.sparkts.DateTimeIndex._
-import com.cloudera.sparkts.{EasyPlot, TimeSeries}
+import com.cloudera.sparkts.{EasyPlot, TimeSeries, TimeSeriesRDD}
 import com.cloudera.sparkts.TimeSeriesRDD._
-import com.cloudera.sparkts.TimeSeriesRDD
 
 import com.github.nscala_time.time.Imports._
 
@@ -37,8 +36,11 @@ import scala.collection.Iterable
 
 object PortfolioOptimizationExample {
   def main(args: Array[String]): Unit = {
-    val path = "/Users/josecambronero/Projects/spark-timeseries/src/main/resources/"
-    val inputDir = path + "data"
+    require(args.length == 2, "Usage: <data-path> <save-path>")
+    // to replicate the experiment, you should point this to
+    // the data folder in the src/main/resources/
+    val dataPath = args(0)
+    val savePath = args(1)
     val sc = new SparkContext("local", "portfolioOptim")
 
     // Let's warm up with some simulated data
@@ -53,17 +55,23 @@ object PortfolioOptimizationExample {
     val avgSampledRets = sparkVectortoBreeze(sampledRetMatrix.computeColumnSummaryStatistics().mean)
     val sampledRetsCov = sparkMatrixtoBreeze(sampledRetMatrix.computeCovariance())
 
-    // random portfolios
+    // random portfolios as column matrices of weights
     val randPortfolios = Array.fill(1000)(Array.fill(nRandAssets)(math.random)).
       map(p => p.map(_ / p.sum)).
-      map(p => new DenseMatrix(nRandAssets, 1, p))
+      map(w => new DenseMatrix(nRandAssets, 1, w))
 
     val randReturns = randPortfolios.map(x => ret(avgSampledRets, x.toDenseVector))
-    val randSDs = randPortfolios.map(risk(sampledRetsCov, _))
+    val randVars = randPortfolios.map(risk(sampledRetsCov, _))
 
-    val randPortfolioPlot = EasyPlot.ezplot(x = randSDs.map(math.pow(_, 2)), y = randReturns, '.')
-    addLabels(randPortfolioPlot, Some("Portfolio Variance"), Some("Portfolio Expected Return"))
-    randPortfolioPlot.saveas(path + "rand_portfolios.png")
+    val randPortfolioPlot = EasyPlot.ezplot(x = randVars, y = randReturns, '.')
+    beautifyPlot(
+      randPortfolioPlot,
+      Some("Portfolio Variance"),
+      Some("Portfolio Expected Return"),
+      xDecimalTicks = true,
+      yDecimalTicks = true
+    )
+    randPortfolioPlot.saveas(savePath + "/rand_portfolios.png")
 
     val randFrontierPoints = markowitzFrontier(sc,
       sampledRetsCov,
@@ -72,22 +80,19 @@ object PortfolioOptimizationExample {
       max(randReturns),
       100000)
 
-    // add the frontier to the plot of random portfolios
-    // unfortunately cannot clone a plot, so we'll have to mutate :(
+    // add the efficient frontier to the plot of random portfolios
+    // unfortunately cannot clone a plot, so we'll have to mutate the original
     randPortfolioPlot.subplot(0) += plot(
-      x = randFrontierPoints.map(_._2).map(math.pow(_, 2)),
+      x = randFrontierPoints.map(_._2),
       y = randFrontierPoints.map(_._1),
       colorcode = "red",
-      style = '.',
-      name = "efficient frontier"
+      style = '.'
     )
-    randPortfolioPlot.saveas(path + "rand_portfolios_with_frontier.png")
+    randPortfolioPlot.saveas(savePath + "/rand_portfolios_with_frontier.png")
 
     // Real data example: daily price data from Yahoo finance
-    // Load and parse the data, you might
-    // want to make sure you deleted all files with 0 data (wget still creates a file
-    // for them), from command line: find data/ -size 0 | xargs -I {} rm -rf {}
-    val seriesByFile: RDD[TimeSeries] = YahooParser.yahooFiles(inputDir, sc)
+    // Make sure to run the download script prior to this example
+    val seriesByFile: RDD[TimeSeries] = YahooParser.yahooFiles(dataPath, sc)
 
     // Merge the series from individual files into a TimeSeriesRDD and just take closes
     val start = seriesByFile.map(_.index.first).takeOrdered(1).head
@@ -101,6 +106,7 @@ object PortfolioOptimizationExample {
     val recentRdd = tsRdd.slice(startDate, endDate)
 
     // take only part of the universe for our portfolio (first X number of series)
+    // but don't collect it locally yet
     val nAssets = 200
     val reducedRdd = lazyTake(recentRdd, nAssets)
 
@@ -124,8 +130,12 @@ object PortfolioOptimizationExample {
 
     // let's plot out the average returns for out investment universe
     val avgReturnsPerAssetPlot = EasyPlot.ezplot(avgReturnsPerAsset)
-    addLabels(avgReturnsPerAssetPlot, ylabel = Some("Average Returns Per Asset"))
-    avgReturnsPerAssetPlot.saveas(path + "avg_returns_per_asset.png")
+    beautifyPlot(
+      avgReturnsPerAssetPlot,
+      ylabel = Some("Average Returns Per Asset"),
+      yDecimalTicks = true
+    )
+    avgReturnsPerAssetPlot.saveas(savePath + "/avg_returns_per_asset.png")
 
     /// Woah! one of these tickers is clearly an outlier...Not reasonable
     val List(pos) = which(avgReturnsPerAsset.toArray, (x: Double) => x == max(avgReturnsPerAsset))
@@ -133,7 +143,9 @@ object PortfolioOptimizationExample {
     val culpritTicker = returnRdd.keys.collect()(pos)
     // Let's check out prices without any of our imputation
     val culpritPrices = recentRdd.lookup(culpritTicker).head
-    EasyPlot.ezplot(culpritPrices)
+    val culpritPricePlot = EasyPlot.ezplot(culpritPrices)
+    beautifyPlot(culpritPricePlot, ylabel = Some("price"))
+    culpritPricePlot.saveas(savePath + "/AMSC_raw_prices.png")
 
     // Clearly was some kind of jump in prices, let's check the date of the largest increase
     val culpritPxDeltas = diff(culpritPrices.toDenseVector).toArray
@@ -143,7 +155,7 @@ object PortfolioOptimizationExample {
     // add 1, since Breeze's diff drops 1 item
     val culpritDate = recentRdd.index.dateTimeAtLoc(dateIxMinus1 + 1)
     // according to http://ir.amsc.com/releasedetail.cfm?ReleaseID=903185
-    // AMSC had a reverse stock split, filter out
+    // AMSC had a reverse stock split, filter out this ticker
     val cleanRdd = filledRdd.filter(_._1 != culpritTicker).price2ret()
     val cleanMatrix = cleanRdd.toRowMatrix()
     val cleanAvgAssetRet = sparkVectortoBreeze(cleanMatrix.computeColumnSummaryStatistics().mean)
@@ -158,27 +170,33 @@ object PortfolioOptimizationExample {
         100000
       )
     val frontierReturns = frontierPoints.map(_._1)
-    val frontierSDs = frontierPoints.map(_._2)
+    val frontierVars= frontierPoints.map(_._2)
 
-    // graph it
     val finalFrontierPlot = EasyPlot.ezplot(
-      x = frontierSDs.map(x => math.pow(x, 2)),
+      x = frontierVars,
       y = frontierReturns,
       '.'
     )
+    beautifyPlot(
+      finalFrontierPlot,
+      Some("Portfolio Variance"),
+      Some("Portfolio Expected Return"),
+      xDecimalTicks = true,
+      yDecimalTicks = true
+    )
+    finalFrontierPlot.saveas(savePath + "/final_frontier.png")
 
-    addLabels(finalFrontierPlot, Some("Portfolio Variance"), Some("Portfolio Expected Return"))
-    finalFrontierPlot.saveas(path + "final_frontier.png")
+    sc.stop()
   }
 
 
   // Some quick utility functions
-  // Calculates the standard deviation of a portfolio (i.e. the risk)
+  // Calculates the variance of a portfolio (i.e. the risk)
   def risk(cov: DenseMatrix[Double], weights: DenseMatrix[Double]): Double = {
     // writing out types to avoid having intellij incorrectly highlight issues
     val wByCov: DenseMatrix[Double] = weights.t * cov
     val variance: DenseMatrix[Double] = wByCov * weights
-    math.sqrt(variance(0, 0))
+    variance(0, 0)
   }
 
   // Calculates the expected return of a portfolio
@@ -232,43 +250,44 @@ object PortfolioOptimizationExample {
     invertedMatrix: DenseMatrix[Double],
     expectedReturn: Double): (Double, Double, DenseVector[Double]) = {
     val nAssets = invertedMatrix.rows - 2
-    /// rhs of linear system
+    // rhs of linear system
     val rhs = DenseMatrix.zeros[Double](nAssets + 2, 1)
     rhs(-2, 0) = 1.0
     rhs(-1, 0) = expectedReturn
     // explicitly state type...since it seems intellij not picking it up despite compilation
     val solution: DenseMatrix[Double] = invertedMatrix * rhs
-    val weights = solution(0 to -3, ::) // drop last 2 elements (values for lagrangian multipliers)
-    val sd = risk(covMatrix, weights)
-    (expectedReturn, sd, weights.toDenseVector)
+    // drop last 2 elements (values for lagrangian multipliers)
+    val weights = solution(0 to -3, ::)
+    val variance = risk(covMatrix, weights)
+    (expectedReturn, variance, weights.toDenseVector)
   }
 
   /**
-   * Creates the constant part of the LHS of the system of equations to solve for the weights that
+   * Creates the constant part of the system of equations to solve for the weights that
    * produce the minimal weights given a set of returns/covariance of returns/equality constraints
    * See [[http://www.maths.usyd.edu.au/u/alpapani/riskManagement/lecture4.pdf]] for more
    * information
-   * @param covMatrix Covariance of returns
-   * @param returns Expected return for each individual asset
+   * @param covMatrix covariance of returns
+   * @param returns expected return for each individual asset
    * @return
    */
-  def assembleLinearSystem(
+  def assembleDesignMatrix(
     covMatrix: DenseMatrix[Double],
     returns: DenseVector[Double]): DenseMatrix[Double] = {
     val n = returns.length
     val onesAndReturns = new DenseMatrix(n, 2, Array.fill(n)(1.0) ++ returns.toArray)
     val zeros = DenseMatrix.zeros[Double](2, 2)
     DenseMatrix.vertcat(
-     DenseMatrix.horzcat(covMatrix, onesAndReturns * -1.0),
-     DenseMatrix.horzcat(onesAndReturns.t, zeros)
+      DenseMatrix.horzcat(covMatrix, onesAndReturns * -1.0),
+      DenseMatrix.horzcat(onesAndReturns.t, zeros)
    )
   }
 
   /**
    * Computes the inverse, and if fails, the pseudo-inverse of a matrix
    * For more information see [[http://www.scalanlp.org/api/breeze/index.html#breeze.linalg.pinv$]]
-   * @param m
-   * @return
+   * @param m matrix to invert
+   * @return inverse or pseudo-inverse matrix (only if former fails)
    */
   def safeInversion(m: DenseMatrix[Double]): DenseMatrix[Double] = {
     Try(inv(m)) match {
@@ -282,14 +301,14 @@ object PortfolioOptimizationExample {
 
   /**
    * Computes the efficient frontier for a given set of assets along various expected return points
-   * @param sc A SparkContext to distribute the linear system solving for each expected return
-   * @param covMatrix A covariance matrix for the assets
-   * @param returns A vector of expected return for each individual asset
-   * @param s The starting expected return for frontier
-   * @param e The ending expected return for frontier
-   * @param len The number of points between starting and ending points of frontier (uniformly
+   * @param sc a SparkContext to distribute the linear system solving for each expected return
+   * @param covMatrix a covariance matrix for the assets
+   * @param returns a vector of expected return for each individual asset
+   * @param s the starting expected return for frontier
+   * @param e the ending expected return for frontier
+   * @param len the number of points between starting and ending points of frontier (uniformly
    *           spaced)
-   * @return An array containing triples of the form ( expected return, variance, weight allocation)
+   * @return an array containing triples of the form (expected return, variance, weight allocation)
    */
   def markowitzFrontier(
       sc: SparkContext,
@@ -298,18 +317,31 @@ object PortfolioOptimizationExample {
       s: Double,
       e: Double,
       len: Int): Array[(Double, Double, DenseVector[Double])] = {
+    val design = assembleDesignMatrix(covMatrix, returns)
+    val invertedDesign = safeInversion(design)
     val delta = (e - s) / len
-    val lhs = assembleLinearSystem(covMatrix, returns)
-    val invertedLHS = safeInversion(lhs)
     val expectedReturns = sc.parallelize((s to e by delta).toArray[Double])
-    expectedReturns.map { r => markowitzSolveFrontierPoint(covMatrix, invertedLHS, r) }.collect()
+    expectedReturns.map { r => markowitzSolveFrontierPoint(covMatrix, invertedDesign, r) }.collect()
   }
 
   // simple convenience function to add labels to an existing figure
-  def addLabels(f: Figure, xlabel: Option[String] = None, ylabel: Option[String] = None): Unit = {
-    // assume the plot is at position 0
+  // and turn on decimal tick marks
+  def beautifyPlot(
+    f: Figure,
+    xlabel: Option[String] = None,
+    ylabel: Option[String] = None,
+    xDecimalTicks: Boolean = false,
+    yDecimalTicks: Boolean = false): Unit = {
+    // assumes the plot is at position 0
     xlabel.foreach(f.subplot(0).xlabel_=)
     ylabel.foreach(f.subplot(0).ylabel_=)
+
+    if (xDecimalTicks) {
+      f.subplot(0).setXAxisDecimalTickUnits()
+    }
+    if (yDecimalTicks) {
+      f.subplot(0).setYAxisDecimalTickUnits()
+    }
   }
 }
 
