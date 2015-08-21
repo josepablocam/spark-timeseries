@@ -17,6 +17,7 @@ package com.cloudera.finance.examples
 
 import breeze.linalg._
 import breeze.plot.{Figure, plot}
+
 import com.cloudera.finance.YahooParser
 import com.cloudera.sparkts.DateTimeIndex._
 import com.cloudera.sparkts.{EasyPlot, TimeSeries, TimeSeriesRDD}
@@ -24,10 +25,11 @@ import com.cloudera.sparkts.TimeSeriesRDD._
 
 import com.github.nscala_time.time.Imports._
 
-import org.apache.spark.SparkContext
-import org.apache.spark.rdd.RDD
+import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.mllib.linalg.{Matrix => SparkMatrix, Vector => SparkVector, Vectors}
 import org.apache.spark.mllib.linalg.distributed.RowMatrix
+import org.apache.spark.rdd.RDD
+import org.apache.spark.SparkContext
 
 import org.apache.commons.math3.random.MersenneTwister
 
@@ -239,16 +241,21 @@ object PortfolioOptimizationExample {
    * Note that the weights returned are NOT constrainted to be >=0 nor < 1. Users are encouraged
    * to filter results as desired (negative weights imply short selling, and weights >1 imply
    * leverage), see [[http://www.norstad.org/finance/portopt1.pdf]] for more information.
-   * @param covMatrix a covariance matrix for returns
-   * @param invertedMatrix the inverted matrix used to solve the system of equations, we provide
-   *                       this as a parameter to avoid inversion for each point we want to solve
+   * @param covMatrixBroadcast a covariance matrix for returns, broadcasted with Spark to avoid
+   *                           shipping with each operation
+   * @param invertedMatrixBroadcast the inverted matrix used to solve the system of equations, we
+   *                       this as a parameter to avoid inversion for each point we want to solve,
+   *                       furthermore, we broadcast it using Spark to avoid shipping with each
+   *                       operation
    * @param expectedReturn Expected return level to solve for
    * @return a triple of the form (expected return, variance, weights)
    */
   def markowitzSolveFrontierPoint(
-    covMatrix: DenseMatrix[Double],
-    invertedMatrix: DenseMatrix[Double],
+    covMatrixBroadcast: Broadcast[DenseMatrix[Double]],
+    invertedMatrixBroadcast: Broadcast[DenseMatrix[Double]],
     expectedReturn: Double): (Double, Double, DenseVector[Double]) = {
+    val covMatrix = covMatrixBroadcast.value
+    val invertedMatrix = invertedMatrixBroadcast.value
     val nAssets = invertedMatrix.rows - 2
     // rhs of linear system
     val rhs = DenseMatrix.zeros[Double](nAssets + 2, 1)
@@ -319,9 +326,13 @@ object PortfolioOptimizationExample {
       len: Int): Array[(Double, Double, DenseVector[Double])] = {
     val design = assembleDesignMatrix(covMatrix, returns)
     val invertedDesign = safeInversion(design)
+    val invertedDesignBroadcast = sc.broadcast(invertedDesign)
+    val covMatrixBroadcast = sc.broadcast(covMatrix)
     val delta = (e - s) / len
     val expectedReturns = sc.parallelize((s to e by delta).toArray[Double])
-    expectedReturns.map { r => markowitzSolveFrontierPoint(covMatrix, invertedDesign, r) }.collect()
+    expectedReturns.map { r =>
+      markowitzSolveFrontierPoint(covMatrixBroadcast, invertedDesignBroadcast, r)
+    }.collect()
   }
 
   // simple convenience function to add labels to an existing figure
